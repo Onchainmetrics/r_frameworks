@@ -33,6 +33,12 @@ insider_addresses <- insider_addresses[insider_addresses %in% early_buyers]
 current_balances <- fread("TROLL_all_balances.csv")
 current_balances$address <- trimws(current_balances$address)
 
+
+# --- 2.5. Total Supply Configuration ---
+# Use available supply from the dataset (accounts for burns, lost tokens, etc.)
+total_supply <- sum(current_balances$current_balance)
+cat("Using available supply from dataset:", format(total_supply, scientific = FALSE), "tokens\n")
+cat("This accounts for burned tokens and inaccessible wallets\n\n")
 # --- 2. Exclude AMMs, contracts, etc. ---
 exclude_addresses <- c(
   "BAX9M9a5FVy5cNiewwnuwkVDzhSg9psZnb4fJ9r677tN",
@@ -128,6 +134,34 @@ transfers <- unique(transfers, by = c("from_owner", "to_owner", "amount", "block
 transfers$from_owner <- trimws(transfers$from_owner)
 transfers$to_owner <- trimws(transfers$to_owner)
 
+
+# --- 3.5. Load Exchange Wallets and Filter from Transfers ---
+# Load exchange wallet information early to prevent descendant contamination
+exchange_wallets_early <- tryCatch({
+  read_csv("CEX_wallets.csv", show_col_types = FALSE)
+}, error = function(e) {
+  cat("WARNING: CEX_wallets.csv not found. Descendant analysis may include exchange contamination.\n")
+  cat("To prevent this, place CEX_wallets.csv in the working directory.\n")
+  data.frame(address = character(0), cex_name = character(0), distinct_name = character(0))
+})
+
+exchange_addresses_early <- exchange_wallets_early$address
+cat("Filtering", length(exchange_addresses_early), "exchange addresses from transfer analysis\n")
+
+# Filter exchange wallets from transfers to prevent descendant contamination
+if (length(exchange_addresses_early) > 0) {
+  transfers_original_count <- nrow(transfers)
+  transfers <- transfers %>%
+    filter(!from_owner %in% exchange_addresses_early & !to_owner %in% exchange_addresses_early)
+  
+  transfers_filtered_count <- nrow(transfers)
+  cat("Removed", transfers_original_count - transfers_filtered_count, "transfers involving exchanges\n")
+  cat("Remaining transfers for descendant analysis:", transfers_filtered_count, "\n")
+} else {
+  cat("No exchange addresses loaded - descendant analysis will include all transfers\n")
+}
+cat("This prevents exchange wallets from corrupting insider descendant networks\n\n")
+
 # --- 4. Descendant Tracing Function ---
 find_descendants <- function(seed_addresses, transfers, exclude_addresses) {
   descendant_set <- seed_addresses
@@ -170,26 +204,27 @@ summary_table_early <- current_balances_early %>%
   group_by(group) %>%
   summarise(
     wallets = n(),
-    total_supply = sum(current_balance),
+    group_balance = sum(current_balance),  # Renamed to avoid confusion
     .groups = "drop"
   ) %>%
   mutate(
-    supply_pct = total_supply / sum(total_supply) * 100,
+    supply_pct = group_balance / total_supply * 100,  # Use the global total_supply variable
     wallet_pct = wallets / sum(wallets) * 100
-  )
+  ) %>%
+  select(group, wallets, total_supply = group_balance, supply_pct, wallet_pct)  # Rename back for compatibility
 
 summary_table_insider <- current_balances_insider %>%
   group_by(group) %>%
   summarise(
     wallets = n(),
-    total_supply = sum(current_balance),
+    group_balance = sum(current_balance),  # Renamed to avoid confusion
     .groups = "drop"
   ) %>%
   mutate(
-    supply_pct = total_supply / sum(total_supply) * 100,
+    supply_pct = group_balance / total_supply * 100,  # Use the global total_supply variable
     wallet_pct = wallets / sum(wallets) * 100
-  )
-
+  ) %>%
+  select(group, wallets, total_supply = group_balance, supply_pct, wallet_pct)  # Rename back for compatibility
 
 
 # --- 8. Print Results ---
@@ -198,6 +233,16 @@ print(summary_table_insider)
 
 cat("Total wallets (Early Buyer cohort):", sum(summary_table_early$wallets), "\n")
 cat("Total wallets (Insider cohort):", sum(summary_table_insider$wallets), "\n")
+
+# DIAGNOSTIC: Track late buyer supply through the pipeline
+cat("\n=== LATE BUYER SUPPLY TRACKING DIAGNOSTIC ===\n")
+late_buyer_supply_early <- summary_table_insider$total_supply[summary_table_insider$group == "Late Buyer"]
+late_buyer_pct_early <- summary_table_insider$supply_pct[summary_table_insider$group == "Late Buyer"]
+late_buyer_count_early <- summary_table_insider$wallets[summary_table_insider$group == "Late Buyer"]
+
+cat("Late Buyer supply from summary table:", round(late_buyer_pct_early, 4), "%\n")
+cat("Late Buyer count from summary table:", late_buyer_count_early, "addresses\n")
+cat("This will be compared with later calculations to identify where supply is lost.\n")
 
 ##VISUALIZATIONS
 
@@ -351,6 +396,7 @@ eb_holdings <- current_balances_early %>%
   select(address, supply_pct) %>%
   as_tibble()
 
+####CLUSTERING
 # -- CLUSTERING SECTION
 
 # --- 1. Build Edge List ---
@@ -543,7 +589,7 @@ print("=== FIXED: TOP ENTITIES INCLUDING INDIVIDUALS ===")
 print(top_entities_by_supply)
 
 # --- 12. Check if a Specific Address is in a Cluster ---
-query_address <- "9qpucJgTkTVSbMPksG4fequu9STgFxr9AQmLN25MwiBV"
+query_address <- "3pcz387Lg1xgYDQxgt3nSSzMV5u4PqmvjwgQ9qa66MNa"
 address_info <- address_component_df_no_hubs %>%
   filter(address == query_address)
 
@@ -639,23 +685,144 @@ cat("Top cluster supply %:", max(cluster_summaries$total_supply_pct, na.rm = TRU
 
 
 # ===============================================================================
-# LATE BUYER CLUSTERING SECTION
+# EXCHANGE WALLET DETECTION AND CLASSIFICATION
 # ===============================================================================
 
-cat("\n=== STARTING LATE BUYER CLUSTER ANALYSIS ===\n")
+cat("\n=== USING PREVIOUSLY LOADED EXCHANGE WALLET DATA ===\n")
 
-# --- 1. Extract Late Buyers ---
-late_buyers <- current_balances_insider %>%
+# Use exchange wallet information loaded earlier (to prevent descendant contamination)
+exchange_wallets <- exchange_wallets_early
+exchange_addresses <- exchange_addresses_early
+cat("Using", length(exchange_addresses), "exchange wallet addresses (loaded earlier)\n")
+
+if (length(exchange_addresses) > 0) {
+  exchange_summary <- exchange_wallets %>%
+    group_by(cex_name) %>%
+    summarise(wallet_count = n(), .groups = "drop") %>%
+    arrange(desc(wallet_count))
+  
+  cat("Exchange breakdown:\n")
+  print(exchange_summary)
+}
+
+# Create exchange address vector for quick lookup
+exchange_addresses <- exchange_wallets$address
+cat("Loaded", length(exchange_addresses), "exchange wallet addresses\n")
+
+if (length(exchange_addresses) > 0) {
+  exchange_summary <- exchange_wallets %>%
+    group_by(cex_name) %>%
+    summarise(wallet_count = n(), .groups = "drop") %>%
+    arrange(desc(wallet_count))
+  
+  cat("Exchange breakdown:\n")
+  print(exchange_summary)
+}
+
+# ===============================================================================
+# LATE BUYER CLUSTERING SECTION (RETAIL ONLY)
+# ===============================================================================
+
+cat("\n=== STARTING LATE BUYER CLUSTER ANALYSIS (RETAIL ONLY) ===\n")
+
+# Separate late buyers into Exchange vs Retail categories
+late_buyers_all <- current_balances_insider %>%
   filter(group == "Late Buyer") %>%
   arrange(desc(current_balance)) %>%
   mutate(
-    supply_pct = round(current_balance / sum(current_balances$current_balance) * 100, 6)
-  ) %>%
+    supply_pct = current_balance / total_supply * 100,
+    # Classify as Exchange or Retail
+    category = ifelse(address %in% exchange_addresses, "Exchange", "Retail")
+  )
+
+# Display exchange vs retail breakdown
+cat("\n=== LATE BUYER CATEGORY BREAKDOWN ===\n")
+category_summary <- late_buyers_all %>%
+  group_by(category) %>%
+  summarise(
+    count = n(),
+    total_supply_pct = sum(supply_pct),
+    avg_supply_pct = mean(supply_pct),
+    median_supply_pct = median(supply_pct),
+    max_supply_pct = max(supply_pct),
+    .groups = "drop"
+  )
+print(category_summary)
+
+# DIAGNOSTIC: Check for supply calculation discrepancy
+cat("\n=== SUPPLY CALCULATION DIAGNOSTIC ===\n")
+original_late_buyer_supply <- sum(current_balances_insider$current_balance[current_balances_insider$group == "Late Buyer"]) / total_supply * 100
+new_calculation_supply <- sum(late_buyers_all$supply_pct, na.rm = TRUE)
+
+cat("Late Buyer supply from summary table:", round(late_buyer_pct_early, 4), "%\n")
+cat("Late Buyer supply recalculated here:", round(original_late_buyer_supply, 4), "%\n")
+cat("New calculation supply (Exchange + Retail):", round(new_calculation_supply, 4), "%\n")
+
+# Check for discrepancies
+summary_vs_recalc_diff <- late_buyer_pct_early - original_late_buyer_supply
+recalc_vs_new_diff <- original_late_buyer_supply - new_calculation_supply
+
+cat("Summary table vs recalculation difference:", round(summary_vs_recalc_diff, 4), "%\n")
+cat("Recalculation vs new calculation difference:", round(recalc_vs_new_diff, 4), "%\n")
+
+if (abs(summary_vs_recalc_diff) > 0.1) {
+  cat("WARNING: Discrepancy between summary table and recalculation!\n")
+  cat("This suggests different total_supply values were used.\n")
+}
+
+if (abs(recalc_vs_new_diff) > 0.1) {
+  cat("WARNING: Significant supply calculation discrepancy detected!\n")
+  cat("This suggests addresses or balances are being lost in the process.\n")
+}
+# Extract exchange wallets for separate analysis
+late_buyers_exchange <- late_buyers_all %>%
+  filter(category == "Exchange") %>%
+  left_join(exchange_wallets %>% select(address, cex_name, distinct_name), by = "address")
+
+if (nrow(late_buyers_exchange) > 0) {
+  cat("\n=== EXCHANGE WALLETS IN LATE BUYERS ===\n")
+  exchange_holdings <- late_buyers_exchange %>%
+    arrange(desc(supply_pct)) %>%
+    select(address, cex_name, distinct_name, supply_pct, current_balance) %>%
+    mutate(
+      address_short = paste0(substr(address, 1, 8), "..."),
+      supply_pct = round(supply_pct, 4)
+    )
+  print(exchange_holdings)
+  
+  # Exchange summary by CEX
+  exchange_by_cex <- late_buyers_exchange %>%
+    group_by(cex_name) %>%
+    summarise(
+      wallet_count = n(),
+      total_supply_pct = sum(supply_pct),
+      avg_supply_pct = mean(supply_pct),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(total_supply_pct))
+  
+  cat("\n=== EXCHANGE HOLDINGS BY CEX ===\n")
+  print(exchange_by_cex)
+}
+
+# Extract retail late buyers for clustering analysis
+late_buyers <- late_buyers_all %>%
+  filter(category == "Retail")
+
+cat("\n=== RETAIL LATE BUYER FILTERING ===\n")
+cat("Original late buyers (all):", nrow(late_buyers_all), "\n")
+cat("Exchange wallets removed:", nrow(late_buyers_exchange), "\n") 
+cat("Retail late buyers for clustering:", nrow(late_buyers), "\n")
+cat("Exchange supply excluded:", round(sum(late_buyers_exchange$supply_pct, na.rm = TRUE), 4), "%\n")
+cat("Retail supply for analysis:", round(sum(late_buyers$supply_pct, na.rm = TRUE), 4), "%\n")
+
+# Apply minimum threshold to retail late buyers
+late_buyers <- late_buyers %>%
   filter(supply_pct >= 0.001) %>%  # Only significant holders
   as_tibble()
 
-cat("Total Late Buyers with significant holdings (>0.001%):", nrow(late_buyers), "\n")
-cat("Late Buyer supply coverage:", round(sum(late_buyers$supply_pct), 2), "%\n")
+cat("Retail Late Buyers with significant holdings (>0.001%):", nrow(late_buyers), "\n")
+cat("Retail Late Buyer supply coverage:", round(sum(late_buyers$supply_pct), 2), "%\n")
 
 # --- 2. Build Late Buyer Transfer Network ---
 # Find transfers between late buyers
@@ -679,7 +846,7 @@ late_buyer_transfers <- transfers %>%
 
 cat("Late buyer transfer connections found:", nrow(late_buyer_transfers), "\n")
 
-# --- 3. Build Late Buyer Network Graph ---
+# --- 3. Build Late Buyer Network Graph --- tirar todo junto
 if (nrow(late_buyer_transfers) > 0) {
   
   g_late <- graph_from_data_frame(late_buyer_transfers, directed = TRUE)
@@ -870,9 +1037,122 @@ if (nrow(late_buyer_transfers) > 0) {
     select(address, wallet_type, current_balance, supply_pct, classification, late_cluster_id)
   
   write_csv(late_buyer_comprehensive, "late_buyer_clusters_comprehensive.csv")
+  
+}
 }
 
+# ===============================================================================
+# COMPREHENSIVE THREE-TIER EXPORT
+# ===============================================================================
+
+cat("\n=== CREATING COMPREHENSIVE THREE-TIER EXPORT ===\n")
+
+# Combine all three categories into one comprehensive dataset
+comprehensive_analysis <- bind_rows(
+  # 1. Insider/Descendant data
+  insider_wallets_comprehensive %>%
+    mutate(
+      category = "Insider/Descendant",
+      cex_name = NA_character_,
+      distinct_name = NA_character_
+    ) %>%
+    select(address, category, wallet_type, current_balance, supply_pct, classification, 
+           cluster_id, cex_name, distinct_name),
   
+  # 2. Retail Late Buyer data (if clustering was successful)
+  if (exists("late_buyer_comprehensive") && nrow(late_buyer_comprehensive) > 0) {
+    late_buyer_comprehensive %>%
+      mutate(
+        category = "Retail Late Buyer",
+        cluster_id = late_cluster_id,
+        cex_name = NA_character_,
+        distinct_name = NA_character_
+      ) %>%
+      select(address, category, wallet_type, current_balance, supply_pct, classification,
+             cluster_id, cex_name, distinct_name)
+  } else {
+    # Empty dataframe with correct structure if no late buyer clustering
+    data.frame(
+      address = character(0), category = character(0), wallet_type = character(0),
+      current_balance = numeric(0), supply_pct = numeric(0), classification = character(0),
+      cluster_id = character(0), cex_name = character(0), distinct_name = character(0)
+    )
+  },
+  
+  # 3. Exchange data
+  if (nrow(late_buyers_exchange) > 0) {
+    late_buyers_exchange %>%
+      mutate(
+        category = "Exchange/Institutional",
+        wallet_type = "Exchange",
+        classification = "Individual",
+        cluster_id = "N/A"
+      ) %>%
+      select(address, category, wallet_type, current_balance, supply_pct, classification,
+             cluster_id, cex_name, distinct_name)
+  } else {
+    # Empty dataframe with correct structure if no exchanges found
+    data.frame(
+      address = character(0), category = character(0), wallet_type = character(0),
+      current_balance = numeric(0), supply_pct = numeric(0), classification = character(0),
+      cluster_id = character(0), cex_name = character(0), distinct_name = character(0)
+    )
+  }
+) %>%
+  arrange(desc(supply_pct))
+
+# Export comprehensive analysis
+write_csv(comprehensive_analysis, "comprehensive_three_tier_analysis.csv")
+
+# Final summary statistics
+cat("\n=== FINAL THREE-TIER ANALYSIS SUMMARY ===\n")
+final_summary <- comprehensive_analysis %>%
+  group_by(category) %>%
+  summarise(
+    address_count = n(),
+    total_supply_pct = round(sum(supply_pct, na.rm = TRUE), 4),
+    avg_supply_pct = round(mean(supply_pct, na.rm = TRUE), 6),
+    median_supply_pct = round(median(supply_pct, na.rm = TRUE), 6),
+    max_supply_pct = round(max(supply_pct, na.rm = TRUE), 4),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_supply_pct))
+
+print(final_summary)
+
+# Exchange-specific summary if exchanges were found
+if (nrow(late_buyers_exchange) > 0) {
+  cat("\n=== EXCHANGE BREAKDOWN ===\n")
+  exchange_breakdown <- comprehensive_analysis %>%
+    filter(category == "Exchange/Institutional") %>%
+    group_by(cex_name) %>%
+    summarise(
+      wallet_count = n(),
+      total_supply_pct = round(sum(supply_pct, na.rm = TRUE), 4),
+      avg_supply_pct = round(mean(supply_pct, na.rm = TRUE), 6),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(total_supply_pct))
+  
+  print(exchange_breakdown)
+}
+
+cat("\n=== ANALYSIS COMPLETE ===\n")
+cat("Files exported:\n")
+cat("- insider_wallets_comprehensive.csv (Insider/Descendant analysis)\n")
+if (exists("late_buyer_comprehensive") && nrow(late_buyer_comprehensive) > 0) {
+  cat("- late_buyer_clusters_comprehensive.csv (Retail late buyer clustering)\n")
+}
+cat("- comprehensive_three_tier_analysis.csv (Complete three-tier analysis)\n")
+
+# Coverage analysis
+total_analyzed_supply <- sum(comprehensive_analysis$supply_pct, na.rm = TRUE)
+cat("\nTotal supply coverage:", round(total_analyzed_supply, 2), "%\n")
+
+if (total_analyzed_supply < 95) {
+  cat("NOTE: Coverage below 95% - consider lowering minimum supply thresholds\n")
+}
+
 
 # === STANDALONE SECTION: LATE BUYER CLUSTER EXPLORATION ===
 # This section can be run independently after the main late buyer clustering analysis
@@ -886,7 +1166,7 @@ if (nrow(late_buyer_transfers) > 0) {
 cat("\n=== LATE BUYER CLUSTER EXPLORATION TOOL ===\n")
 
 # Configuration: Set the cluster number you want to analyze
-late_cluster_number <- 14  # Change this to your cluster of interest
+late_cluster_number <- 1  # Change this to your cluster of interest
 
 # Check if required data exists
 if (!exists("g_late")) {
@@ -1002,8 +1282,6 @@ if (nrow(late_addresses_supply_in_cluster) > 0) {
 
 cat("\n=== CLUSTER EXPLORATION COMPLETE ===\n")
 cat("To explore a different cluster, change 'late_cluster_number' and re-run this section.\n")
-  
-  
 
 
 ##----- INSIDER CSV MEGA SECTION
