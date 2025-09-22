@@ -4,6 +4,8 @@
 [![Graph Analysis](https://img.shields.io/badge/Graph-Theory-green.svg)](https://igraph.org/r/)
 [![Network Analysis](https://img.shields.io/badge/Network-Clustering-orange.svg)](https://en.wikipedia.org/wiki/Community_detection)
 
+This Repo was made public temporarily
+
 Sophisticated R-based statistical framework for cryptocurrency market analysis, specializing in insider network detection, clustering algorithms, and coordinated trading pattern identification. This repository contains production-grade analytical tools combining graph theory, community detection, and advanced statistical modeling.
 
 ## 🎯 Framework Overview
